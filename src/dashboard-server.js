@@ -1,0 +1,755 @@
+import http from "node:http"
+import { WebSocketServer } from "ws"
+
+export function createDashboardServer({ port, getState, onUpdateSettings, onUnlockGroups }) {
+  const clients = new Set()
+
+  const server = http.createServer(async (req, res) => {
+    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`)
+
+    if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
+      res.writeHead(200, {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store, no-cache, must-revalidate",
+      })
+      res.end(renderDashboardHtml())
+      return
+    }
+
+    if (req.method === "GET" && url.pathname === "/settings") {
+      res.writeHead(200, {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store, no-cache, must-revalidate",
+      })
+      res.end(renderSettingsHtml())
+      return
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/state") {
+      res.writeHead(200, {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store, no-cache, must-revalidate",
+      })
+      res.end(JSON.stringify(getState()))
+      return
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/settings") {
+      let incoming = {}
+      try {
+        const raw = await readBody(req)
+        incoming = raw ? JSON.parse(raw) : {}
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" })
+        res.end(JSON.stringify({ error: "Invalid JSON payload" }))
+        return
+      }
+
+      let updated
+      try {
+        updated = await onUpdateSettings(incoming)
+      } catch (error) {
+        res.writeHead(error?.statusCode || 400, {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store, no-cache, must-revalidate",
+        })
+        res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+        return
+      }
+      broadcast({ type: "state", payload: updated })
+      res.writeHead(200, {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store, no-cache, must-revalidate",
+      })
+      res.end(JSON.stringify(updated))
+      return
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/groups/unlock") {
+      let incoming = {}
+      try {
+        const raw = await readBody(req)
+        incoming = raw ? JSON.parse(raw) : {}
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" })
+        res.end(JSON.stringify({ error: "Invalid JSON payload" }))
+        return
+      }
+
+      try {
+        const result = await onUnlockGroups(incoming)
+        res.writeHead(200, {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store, no-cache, must-revalidate",
+        })
+        res.end(JSON.stringify(result))
+      } catch (error) {
+        res.writeHead(error?.statusCode || 403, {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store, no-cache, must-revalidate",
+        })
+        res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+      }
+      return
+    }
+
+    res.writeHead(404, { "Content-Type": "text/plain" })
+    res.end("Not found")
+  })
+
+  const wss = new WebSocketServer({ noServer: true })
+
+  server.on("upgrade", (req, socket, head) => {
+    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`)
+    if (url.pathname !== "/ws") {
+      socket.destroy()
+      return
+    }
+
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit("connection", ws)
+    })
+  })
+
+  wss.on("connection", (ws) => {
+    clients.add(ws)
+    ws.send(JSON.stringify({ type: "state", payload: getState() }))
+
+    ws.on("close", () => {
+      clients.delete(ws)
+    })
+  })
+
+  function broadcast(message) {
+    const encoded = JSON.stringify(message)
+    for (const ws of clients) {
+      if (ws.readyState === 1) ws.send(encoded)
+    }
+  }
+
+  server.listen(port, () => {
+    console.log(`Dashboard running at http://localhost:${port}`)
+  })
+
+  return {
+    close: () => server.close(),
+    broadcast,
+  }
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = []
+    req.on("data", (chunk) => chunks.push(chunk))
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")))
+    req.on("error", reject)
+  })
+}
+
+function renderDashboardHtml() {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WhatsApp Command Center</title>
+  <style>
+    :root {
+      --text: #f3f3f3;
+      --muted: #9f9f9f;
+      --accent: #23d366;
+      --msg-size: 42px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: var(--text);
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      min-height: 100vh;
+      background: radial-gradient(circle at 20% 20%, #1f1f1f 0%, #0a0a0a 55%, #000 100%);
+      transition: background 120ms linear;
+    }
+    body.flashing {
+      animation: bg-pulse 0.75s linear infinite;
+    }
+    @keyframes bg-pulse {
+      0% { background: radial-gradient(circle at 20% 20%, #4a060f 0%, #220106 58%, #140003 100%); }
+      50% { background: radial-gradient(circle at 20% 20%, #b80f24 0%, #5f0714 58%, #30020a 100%); }
+      100% { background: radial-gradient(circle at 20% 20%, #4a060f 0%, #220106 58%, #140003 100%); }
+    }
+    .wrap {
+      padding: 16px;
+      display: grid;
+      gap: 12px;
+      grid-template-rows: auto auto 1fr;
+      height: 100vh;
+    }
+    .top {
+      background: rgba(0,0,0,0.55);
+      border: 1px solid #2f2f2f;
+      border-radius: 12px;
+      padding: 12px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+    .title {
+      font-size: 1.2rem;
+      font-weight: 700;
+      letter-spacing: .04em;
+      margin-right: auto;
+    }
+    .group-names {
+      width: 100%;
+      color: var(--muted);
+      font-size: .86rem;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .badge {
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-weight: 700;
+      font-size: .8rem;
+      background: #2b2b2b;
+      color: #ddd;
+    }
+    .badge.ok { background: #144824; color: #8cf3b2; }
+    .controls {
+      background: rgba(0,0,0,0.55);
+      border: 1px solid #2f2f2f;
+      border-radius: 12px;
+      padding: 12px;
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .note { color: var(--muted); }
+    button, a.btn {
+      border-radius: 8px;
+      border: 1px solid #3a3a3a;
+      background: #191919;
+      color: var(--text);
+      padding: 8px 10px;
+      font-size: .95rem;
+      cursor: pointer;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+    }
+    .danger { border-color: #8c1b27; background: #3a0d13; }
+    .messages {
+      overflow-y: auto;
+      border: 1px solid #2f2f2f;
+      border-radius: 12px;
+      background: rgba(0,0,0,0.52);
+      padding: 14px;
+      display: grid;
+      gap: 12px;
+      align-content: start;
+    }
+    .msg {
+      border: 1px solid #2f2f2f;
+      border-left: 6px solid var(--accent);
+      border-radius: 10px;
+      padding: 12px;
+      background: #151515;
+    }
+    .meta {
+      color: var(--muted);
+      font-size: .92rem;
+      margin-bottom: 8px;
+    }
+    .text {
+      font-size: clamp(16px, var(--msg-size), 120px);
+      line-height: 1.25;
+      font-weight: 700;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .empty {
+      color: var(--muted);
+      font-size: 1.2rem;
+      text-align: center;
+      margin-top: 20px;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top">
+      <div class="title">WhatsApp Command Center</div>
+      <div id="wa-badge" class="badge">WhatsApp: Disconnected</div>
+      <div id="groups-badge" class="badge">Groups: 0</div>
+      <div id="groups-names" class="group-names">Watched groups: none</div>
+    </div>
+
+    <div class="controls">
+      <span id="filter-note" class="note">Filter: all messages</span>
+      <span id="pulse-note" class="note">Pulse: off</span>
+      <a class="btn" href="/settings">Settings</a>
+      <button id="stop-flash" class="danger">Stop Flash (S)</button>
+      <button id="fullscreen">Fullscreen</button>
+    </div>
+
+    <div id="messages" class="messages"></div>
+  </div>
+
+  <script>
+    const messagesEl = document.getElementById('messages');
+    const waBadge = document.getElementById('wa-badge');
+    const groupsBadge = document.getElementById('groups-badge');
+    const groupsNames = document.getElementById('groups-names');
+    const filterNote = document.getElementById('filter-note');
+    const pulseNote = document.getElementById('pulse-note');
+    const stopFlashBtn = document.getElementById('stop-flash');
+    const fullscreenBtn = document.getElementById('fullscreen');
+
+    let state = { messages: [], connected: false, watchedGroups: [], keywordMode: 'all', keywords: [], pulseEnabled: false, pulseMode: 'all', pulseKeywords: [], flashMode: 'all', messageFontSize: 42, groupKeywords: {} };
+
+    function render() {
+      waBadge.textContent = 'WhatsApp: ' + (state.connected ? 'Connected' : 'Disconnected');
+      waBadge.className = 'badge ' + (state.connected ? 'ok' : '');
+      groupsBadge.textContent = 'Groups: ' + (state.watchedGroups || []).length;
+      const names = (state.watchedGroups || []).map((group) => group.name || group.id).filter(Boolean);
+      groupsNames.textContent = 'Watched groups: ' + (names.length ? names.join(', ') : 'none');
+      document.documentElement.style.setProperty('--msg-size', String(state.messageFontSize || 42) + 'px');
+
+      const keywords = state.keywords || [];
+      if (state.keywordMode === 'keywords') {
+        filterNote.textContent = 'Filter: keyword mode (' + (keywords.join(', ') || 'no keywords set') + ')';
+      } else {
+        filterNote.textContent = 'Filter: all messages';
+      }
+
+      if (state.pulseEnabled) {
+        if (state.pulseMode === 'keywords') {
+          const pulseKeywords = state.pulseKeywords || [];
+          pulseNote.textContent = 'Pulse: on (keyword mode: ' + (pulseKeywords.join(', ') || 'no keywords set') + ')';
+        } else {
+          pulseNote.textContent = 'Pulse: on (all messages)';
+        }
+      } else {
+        pulseNote.textContent = 'Pulse: off';
+        document.body.classList.remove('flashing');
+      }
+
+      const rows = (state.messages || []).slice().reverse();
+      if (!rows.length) {
+        messagesEl.innerHTML = '<div class="empty">No messages yet.</div>';
+        return;
+      }
+
+      messagesEl.innerHTML = rows.map((msg) => {
+        const ts = new Date(msg.ts).toLocaleString();
+        return '<div class="msg">'
+          + '<div class="meta">' + escapeHtml(msg.groupName || msg.chatId) + ' | ' + escapeHtml(msg.sender || 'Unknown') + ' | ' + ts + '</div>'
+          + '<div class="text">' + escapeHtml(msg.text || '') + '</div>'
+          + '</div>';
+      }).join('');
+    }
+
+    function escapeHtml(value) {
+      const div = document.createElement('div');
+      div.textContent = String(value || '');
+      return div.innerHTML;
+    }
+
+    function stopFlash() {
+      document.body.classList.remove('flashing');
+    }
+
+    stopFlashBtn.onclick = stopFlash;
+
+    document.addEventListener('keydown', (event) => {
+      if (event.key.toLowerCase() === 's') stopFlash();
+    });
+
+    fullscreenBtn.onclick = async () => {
+      if (!document.fullscreenElement) {
+        await document.documentElement.requestFullscreen();
+      } else {
+        await document.exitFullscreen();
+      }
+    };
+
+    function onSocketMessage(event) {
+      const parsed = JSON.parse(event.data);
+      if (parsed.type === 'state') {
+        state = parsed.payload;
+        render();
+        return;
+      }
+
+      if (parsed.type === 'new-message') {
+        const payload = parsed.payload || {};
+        const message = payload.message || payload;
+        state.messages = (state.messages || []).concat(message).slice(-500);
+        if (payload.flash) {
+          document.body.classList.add('flashing');
+        }
+        render();
+      }
+    }
+
+    async function init() {
+      const first = await fetch('/api/state').then((r) => r.json());
+      state = first;
+      render();
+
+      const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const ws = new WebSocket(wsProtocol + '//' + location.host + '/ws');
+      ws.onmessage = onSocketMessage;
+    }
+
+    init();
+  </script>
+</body>
+</html>`
+}
+
+function renderSettingsHtml() {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Settings - WhatsApp Command Center</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: #0d0d0d;
+      color: #f3f3f3;
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 20px;
+    }
+    .card {
+      width: min(820px, 100%);
+      background: #171717;
+      border: 1px solid #2f2f2f;
+      border-radius: 14px;
+      padding: 18px;
+      display: grid;
+      gap: 14px;
+    }
+    h1 { margin: 0; font-size: 1.4rem; }
+    h2 { margin: 6px 0 0; font-size: 1.05rem; }
+    .muted { color: #a3a3a3; }
+    label { display: inline-flex; gap: 8px; align-items: center; }
+    input[type="text"], input[type="number"], select {
+      width: 100%;
+      border-radius: 8px;
+      border: 1px solid #3a3a3a;
+      background: #111;
+      color: #f3f3f3;
+      padding: 10px;
+      font-size: 1rem;
+    }
+    .group-list {
+      display: grid;
+      gap: 8px;
+      max-height: 280px;
+      overflow: auto;
+      border: 1px solid #2f2f2f;
+      border-radius: 8px;
+      padding: 10px;
+      background: #101010;
+    }
+    .group-row {
+      display: grid;
+      grid-template-columns: auto minmax(140px, 1fr) minmax(220px, 1.3fr);
+      align-items: center;
+      gap: 8px;
+    }
+    .group-row input[type="text"] {
+      padding: 7px 9px;
+      font-size: .93rem;
+    }
+    .row-inline { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .hidden { display: none; }
+    .actions { display: flex; gap: 10px; flex-wrap: wrap; }
+    button, a {
+      border-radius: 8px;
+      border: 1px solid #3a3a3a;
+      background: #1f1f1f;
+      color: #f3f3f3;
+      padding: 10px 12px;
+      font-size: .95rem;
+      text-decoration: none;
+      cursor: pointer;
+    }
+    #status { color: #8cf3b2; min-height: 1.2em; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Display Settings</h1>
+    <div class="muted">Choose what appears on the big screen.</div>
+
+    <h2>Message Filter</h2>
+    <label><input id="keyword-toggle" type="checkbox"> Only show keyword matches</label>
+    <input id="keywords" type="text" placeholder="keywords, comma, separated">
+    <div class="muted">Example: urgent, dispatch, safety</div>
+
+    <h2>Pulse Flash</h2>
+    <label><input id="pulse-enabled" type="checkbox"> Enable red background pulse on new messages</label>
+    <label for="pulse-mode">Pulse behavior</label>
+    <select id="pulse-mode">
+      <option value="all">Pulse on all shown messages</option>
+      <option value="keywords">Pulse on keyword matches only</option>
+    </select>
+    <div id="pulse-keywords-wrap" class="hidden">
+      <label for="pulse-keywords">Pulse keywords</label>
+      <input id="pulse-keywords" type="text" placeholder="urgent, escalation, outage">
+      <div class="muted">Used only for pulse behavior. Separate from message filter keywords.</div>
+    </div>
+
+    <h2>Font Size</h2>
+    <label for="font-size">Message font size (px)</label>
+    <input id="font-size" type="number" min="16" max="120" step="1">
+
+    <h2>Groups</h2>
+    <div class="muted">Protected by PIN. Unlock first to manage group visibility and group keywords.</div>
+    <div id="pin-note" class="muted"></div>
+    <div class="row-inline">
+      <input id="groups-pin" type="password" inputmode="numeric" pattern="[0-9]*" placeholder="Enter PIN" style="max-width:220px;">
+      <button id="unlock-groups" type="button">Unlock Groups</button>
+    </div>
+    <div class="row-inline">
+      <input id="pin-current" type="password" inputmode="numeric" pattern="[0-9]*" placeholder="Current PIN (if set)" style="max-width:220px;">
+      <input id="pin-new" type="password" inputmode="numeric" pattern="[0-9]*" placeholder="New PIN (4-8 digits)" style="max-width:220px;">
+    </div>
+
+    <div id="groups-panel" class="hidden">
+      <input id="group-search" type="text" placeholder="Search groups by name">
+      <div id="group-list" class="group-list"></div>
+    </div>
+
+    <div class="actions">
+      <button id="save">Save</button>
+      <a href="/">Back to Dashboard</a>
+    </div>
+    <div id="status"></div>
+  </div>
+
+  <script>
+    const keywordToggle = document.getElementById('keyword-toggle');
+    const keywordsInput = document.getElementById('keywords');
+    const pulseEnabledInput = document.getElementById('pulse-enabled');
+    const pulseModeInput = document.getElementById('pulse-mode');
+    const pulseKeywordsWrap = document.getElementById('pulse-keywords-wrap');
+    const pulseKeywordsInput = document.getElementById('pulse-keywords');
+    const fontSizeInput = document.getElementById('font-size');
+    const pinNote = document.getElementById('pin-note');
+    const groupsPinInput = document.getElementById('groups-pin');
+    const unlockGroupsBtn = document.getElementById('unlock-groups');
+    const pinCurrentInput = document.getElementById('pin-current');
+    const pinNewInput = document.getElementById('pin-new');
+    const groupsPanel = document.getElementById('groups-panel');
+    const groupSearchInput = document.getElementById('group-search');
+    const groupListEl = document.getElementById('group-list');
+    const statusEl = document.getElementById('status');
+    const saveBtn = document.getElementById('save');
+
+    let knownGroups = [];
+    let watchedIds = new Set();
+    let groupKeywords = {};
+    let groupsUnlocked = false;
+    let hasGroupPin = false;
+    let unlockedPin = '';
+    let groupSearchTerm = '';
+
+    function renderGroups() {
+      if (!knownGroups.length) {
+        groupListEl.innerHTML = '<div class="muted">No groups available yet. Run setup again to refresh group list.</div>';
+        return;
+      }
+
+      const filtered = knownGroups.filter((group) =>
+        String(group.name || group.id).toLowerCase().includes(groupSearchTerm.toLowerCase())
+      );
+      if (!filtered.length) {
+        groupListEl.innerHTML = '<div class="muted">No groups matched your search.</div>';
+        return;
+      }
+
+      groupListEl.innerHTML = filtered.map((group) => {
+        const checked = watchedIds.has(group.id) ? 'checked' : '';
+        const kw = (groupKeywords[group.id] || []).join(', ');
+        return '<div class="group-row">'
+          + '<input type="checkbox" data-group-id="' + escapeHtml(group.id) + '" ' + checked + '>'
+          + '<span>' + escapeHtml(group.name || group.id) + '</span>'
+          + '<input type="text" data-group-keywords="' + escapeHtml(group.id) + '" placeholder="keywords for this group" value="' + escapeHtml(kw) + '">'
+          + '</div>';
+      }).join('');
+    }
+
+    function escapeHtml(value) {
+      const div = document.createElement('div');
+      div.textContent = String(value || '');
+      return div.innerHTML;
+    }
+
+    async function loadState() {
+      const state = await fetch('/api/state').then((r) => r.json());
+      hasGroupPin = Boolean(state.hasGroupPin);
+      pinNote.textContent = hasGroupPin
+        ? 'PIN is set. Enter PIN to unlock group management.'
+        : 'No PIN set yet. You can create one below.';
+      groupsPanel.classList.add('hidden');
+      groupsUnlocked = false;
+      unlockedPin = '';
+
+      keywordToggle.checked = state.keywordMode === 'keywords';
+      keywordsInput.value = (state.keywords || []).join(', ');
+      pulseEnabledInput.checked = Boolean(state.pulseEnabled);
+      pulseModeInput.value = state.pulseMode === 'keywords' ? 'keywords' : 'all';
+      pulseKeywordsInput.value = (state.pulseKeywords || []).join(', ');
+      fontSizeInput.value = Number(state.messageFontSize || 42);
+      updatePulseUi();
+    }
+
+    async function unlockGroups() {
+      const pin = groupsPinInput.value.trim();
+      const res = await fetch('/api/groups/unlock', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ pin }),
+      });
+
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        statusEl.textContent = body.error || 'PIN is incorrect.';
+        return;
+      }
+
+      const data = await res.json();
+      knownGroups = mergeGroups(data.knownGroups || [], data.watchedGroups || []);
+      watchedIds = new Set((data.watchedGroups || []).map((group) => group.id));
+      groupKeywords = data.groupKeywords || {};
+      groupsUnlocked = true;
+      unlockedPin = pin;
+      groupsPanel.classList.remove('hidden');
+      statusEl.textContent = 'Groups unlocked.';
+      renderGroups();
+    }
+
+    unlockGroupsBtn.onclick = unlockGroups;
+
+    groupSearchInput.addEventListener('input', () => {
+      groupSearchTerm = groupSearchInput.value || '';
+      if (groupsUnlocked) renderGroups();
+    });
+
+    groupListEl.addEventListener('input', (event) => {
+      if (!groupsUnlocked) return;
+      const target = event.target;
+      if (!target || target.tagName !== 'INPUT') return;
+      const groupId = target.getAttribute('data-group-keywords');
+      if (!groupId) return;
+      const words = String(target.value || '')
+        .split(',')
+        .map((part) => part.trim())
+        .filter(Boolean);
+      groupKeywords[groupId] = words;
+    });
+
+    groupListEl.addEventListener('change', (event) => {
+      if (!groupsUnlocked) return;
+      const target = event.target;
+      if (!target || target.type !== 'checkbox') return;
+      const groupId = target.getAttribute('data-group-id');
+      if (!groupId) return;
+      if (target.checked) watchedIds.add(groupId);
+      else watchedIds.delete(groupId);
+    });
+
+    function updatePulseUi() {
+      const showPulseKeywords = pulseEnabledInput.checked && pulseModeInput.value === 'keywords';
+      pulseKeywordsWrap.classList.toggle('hidden', !showPulseKeywords);
+    }
+
+    pulseEnabledInput.addEventListener('change', updatePulseUi);
+    pulseModeInput.addEventListener('change', updatePulseUi);
+
+    saveBtn.onclick = async () => {
+      const keywords = keywordsInput.value
+        .split(',')
+        .map((part) => part.trim())
+        .filter(Boolean);
+      const pulseKeywords = pulseKeywordsInput.value
+        .split(',')
+        .map((part) => part.trim())
+        .filter(Boolean);
+      const pinCurrent = pinCurrentInput.value.trim();
+      const pinNew = pinNewInput.value.trim();
+      const pinChanged = pinNew.length > 0;
+
+      const payload = {
+        keywordMode: keywordToggle.checked ? 'keywords' : 'all',
+        keywords,
+        pulseEnabled: pulseEnabledInput.checked,
+        pulseMode: pulseModeInput.value === 'keywords' ? 'keywords' : 'all',
+        pulseKeywords,
+        messageFontSize: Number(fontSizeInput.value || 42),
+        groupPinCurrent: pinCurrent,
+        groupPinNew: pinNew,
+      };
+
+      if (groupsUnlocked) {
+        const watchedGroups = knownGroups.filter((group) => watchedIds.has(group.id));
+        payload.knownGroups = knownGroups;
+        payload.watchedGroups = watchedGroups;
+        payload.groupKeywords = groupKeywords;
+        payload.groupPinAuth = unlockedPin;
+      }
+
+      const res = await fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        statusEl.textContent = body.error || 'Could not save settings.';
+        return;
+      }
+
+      statusEl.textContent = 'Saved.';
+      pinCurrentInput.value = '';
+      pinNewInput.value = '';
+      if (pinChanged) {
+        groupsPanel.classList.add('hidden');
+        groupsUnlocked = false;
+        unlockedPin = '';
+      }
+      await loadState();
+    };
+
+    loadState();
+
+    function mergeGroups(a, b) {
+      const byId = new Map();
+      [a, b].forEach((list) => {
+        (Array.isArray(list) ? list : []).forEach((group) => {
+          const id = String(group && group.id || '').trim();
+          if (!id) return;
+          const name = String(group && group.name || '').trim();
+          if (!byId.has(id)) byId.set(id, { id, name: name || id });
+          else if (name && byId.get(id).name === id) byId.set(id, { id, name });
+        });
+      });
+      return Array.from(byId.values()).sort((x, y) => x.name.localeCompare(y.name));
+    }
+  </script>
+</body>
+</html>`
+}

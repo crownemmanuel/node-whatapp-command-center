@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Runtime / user data
+baileys-auth/
+data/
+wa-qr.png
+*.log
+
+# Environment
+.env
+.env.*
+.env.local
+
+# IDE / OS
+.DS_Store
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Build / coverage
+coverage/
+dist/
+build/

@@ -1,0 +1,27 @@
+# Runtime / user data (created on first run)
+baileys-auth/
+data/
+wa-qr.png
+*.log
+
+# Development
+.git/
+.gitignore
+.env
+.env.*
+*.md
+!README.md
+
+# IDE / OS
+.DS_Store
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Tests / misc
+test/
+tests/
+*.test.js
+*.spec.js
+coverage/
