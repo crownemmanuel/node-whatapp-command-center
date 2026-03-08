@@ -7,12 +7,14 @@ import makeWASocket, {
   fetchLatestBaileysVersion,
   useMultiFileAuthState,
 } from "@whiskeysockets/baileys"
+import { downloadMediaMessage } from "@whiskeysockets/baileys"
 
 const LOG = pino({ name: "whatsapp-command-center", level: process.env.LOG_LEVEL || "info" })
 
 export class WhatsAppBridge {
-  constructor({ sessionDir, onMessage, onConnectionChange }) {
+  constructor({ sessionDir, mediaDir, onMessage, onConnectionChange }) {
     this.sessionDir = sessionDir
+    this.mediaDir = mediaDir
     this.onMessage = onMessage
     this.onConnectionChange = onConnectionChange
     this.sock = null
@@ -67,9 +69,9 @@ export class WhatsAppBridge {
 
     sock.ev.on("messages.upsert", (payload) => {
       if (!this.onMessage) return
-      const rows = toIncomingRows(payload)
-      for (const row of rows) {
-        this.onMessage(row)
+      const messages = Array.isArray(payload?.messages) ? payload.messages : []
+      for (const msg of messages) {
+        void this.processIncomingMessage(msg)
       }
     })
 
@@ -99,6 +101,28 @@ export class WhatsAppBridge {
         this.connecting = this.connect()
       }, 2500)
     })
+  }
+
+  async processIncomingMessage(msg) {
+    const rows = toIncomingRows({ messages: [msg] })
+    for (const row of rows) {
+      if (row.hasImage && this.mediaDir) {
+        try {
+          const buf = await downloadMediaMessage(msg, "buffer")
+          const safeId = (row.id || "").replace(/[^a-zA-Z0-9-_]/g, "_") || "img"
+          const ext = ".jpeg"
+          const filename = safeId + ext
+          const filePath = path.join(this.mediaDir, filename)
+          await fs.mkdir(this.mediaDir, { recursive: true })
+          await fs.writeFile(filePath, buf)
+          row.imageUrl = "/api/media/" + encodeURIComponent(filename)
+        } catch (err) {
+          LOG.warn({ err }, "Failed to download image")
+        }
+      }
+      delete row.hasImage
+      this.onMessage(row)
+    }
   }
 
   resolveWaiters(error) {
@@ -211,26 +235,33 @@ function toIncomingRows(payload) {
     if (!remoteJid.endsWith("@g.us")) continue
 
     const text = extractText(msg.message)
-    if (!text) continue
+    const hasImage = hasImageMessage(msg.message)
+    if (!text && !hasImage) continue
 
     rows.push({
       id: msg.key?.id || `${Date.now()}-${Math.random()}`,
       chatId: remoteJid,
       sender: msg.pushName || msg.key?.participant || "Unknown",
-      text,
+      text: text || "[Image]",
       ts: Number(msg.messageTimestamp || Math.floor(Date.now() / 1000)) * 1000,
       fromMe: Boolean(msg.key?.fromMe),
+      hasImage: hasImage || undefined,
     })
   }
 
   return rows
 }
 
+function hasImageMessage(message) {
+  if (!message || typeof message !== "object") return false
+  return Boolean(message.imageMessage)
+}
+
 function extractText(message) {
   if (!message || typeof message !== "object") return ""
   if (message.conversation) return String(message.conversation)
   if (message.extendedTextMessage?.text) return String(message.extendedTextMessage.text)
-  if (message.imageMessage?.caption) return String(message.imageMessage.caption)
+  if (message.imageMessage) return String(message.imageMessage.caption || "[Image]").trim() || ""
   if (message.videoMessage?.caption) return String(message.videoMessage.caption)
   if (message.documentMessage?.caption) return String(message.documentMessage.caption)
   if (message.pollCreationMessage?.name) return `[Poll] ${message.pollCreationMessage.name}`

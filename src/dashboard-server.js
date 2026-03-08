@@ -1,7 +1,11 @@
+import fs from "node:fs/promises"
 import http from "node:http"
+import path from "node:path"
 import { WebSocketServer } from "ws"
 
-export function createDashboardServer({ port, getState, onUpdateSettings, onUnlockGroups }) {
+const MEDIA_FILENAME_REG = /^[a-zA-Z0-9_.-]+\.(jpeg|jpg|png|gif|webp)$/
+
+export function createDashboardServer({ port, mediaDir, getState, onUpdateSettings, onUnlockGroups }) {
   const clients = new Set()
 
   const server = http.createServer(async (req, res) => {
@@ -93,6 +97,37 @@ export function createDashboardServer({ port, getState, onUpdateSettings, onUnlo
       return
     }
 
+    if (req.method === "GET" && url.pathname.startsWith("/api/media/")) {
+      const filename = decodeURIComponent(url.pathname.slice("/api/media/".length))
+      if (!MEDIA_FILENAME_REG.test(filename) || filename.includes("..")) {
+        res.writeHead(400, { "Content-Type": "text/plain" })
+        res.end("Bad request")
+        return
+      }
+      const filePath = mediaDir ? path.join(mediaDir, filename) : null
+      if (!filePath) {
+        res.writeHead(404, { "Content-Type": "text/plain" })
+        res.end("Not found")
+        return
+      }
+      try {
+        const buf = await fs.readFile(filePath)
+        const ext = path.extname(filename).toLowerCase()
+        const contentType = ext === ".png" ? "image/png" : ext === ".gif" ? "image/gif" : ext === ".webp" ? "image/webp" : "image/jpeg"
+        res.writeHead(200, { "Content-Type": contentType })
+        res.end(buf)
+      } catch (err) {
+        if (err?.code === "ENOENT") {
+          res.writeHead(404, { "Content-Type": "text/plain" })
+          res.end("Not found")
+        } else {
+          res.writeHead(500, { "Content-Type": "text/plain" })
+          res.end("Error")
+        }
+      }
+      return
+    }
+
     res.writeHead(404, { "Content-Type": "text/plain" })
     res.end("Not found")
   })
@@ -127,8 +162,16 @@ export function createDashboardServer({ port, getState, onUpdateSettings, onUnlo
     }
   }
 
-  server.listen(port, () => {
+  server.listen(port, "0.0.0.0", () => {
     console.log(`Dashboard running at http://localhost:${port}`)
+  })
+
+  server.on("error", (err) => {
+    if (err.code === "EADDRINUSE") {
+      console.error(`Port ${port} is already in use. Change it in Settings or stop the other process.`)
+    } else {
+      console.error("Dashboard server error:", err.message)
+    }
   })
 
   return {
@@ -270,6 +313,83 @@ function renderDashboardHtml() {
       white-space: pre-wrap;
       word-break: break-word;
     }
+    .msg-media {
+      margin-top: 8px;
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .msg-thumb {
+      position: relative;
+      flex-shrink: 0;
+    }
+    .msg-thumb img.msg-thumb-img {
+      display: block;
+      max-width: 240px;
+      max-height: 240px;
+      width: auto;
+      height: auto;
+      border-radius: 8px;
+      border: 1px solid #2f2f2f;
+      cursor: pointer;
+    }
+    .msg-thumb img.msg-thumb-img:hover { opacity: 0.9; }
+    .msg-thumb .download-btn {
+      position: absolute;
+      bottom: 6px;
+      right: 6px;
+      width: 28px;
+      height: 28px;
+      border-radius: 6px;
+      background: rgba(0,0,0,0.7);
+      color: var(--text);
+      border: none;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 14px;
+      text-decoration: none;
+      padding: 0;
+    }
+    .msg-thumb .download-btn:hover { background: rgba(35,211,102,0.9); color: #000; }
+    .img-modal-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.9);
+      z-index: 9999;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+    }
+    .img-modal-overlay.open { display: flex; }
+    .img-modal-content {
+      max-width: 95vw;
+      max-height: 95vh;
+      object-fit: contain;
+      pointer-events: none;
+    }
+    .img-modal-close {
+      position: absolute;
+      top: 16px;
+      right: 16px;
+      width: 44px;
+      height: 44px;
+      border-radius: 50%;
+      background: rgba(255,255,255,0.15);
+      color: var(--text);
+      border: 1px solid rgba(255,255,255,0.3);
+      font-size: 24px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      line-height: 1;
+      pointer-events: auto;
+    }
+    .img-modal-close:hover { background: rgba(255,255,255,0.25); }
     .empty {
       color: var(--muted);
       font-size: 1.2rem;
@@ -298,6 +418,11 @@ function renderDashboardHtml() {
     <div id="messages" class="messages"></div>
   </div>
 
+  <div id="img-modal" class="img-modal-overlay" aria-hidden="true">
+    <img id="img-modal-img" class="img-modal-content" src="" alt="Full size">
+    <button type="button" id="img-modal-close" class="img-modal-close" aria-label="Close">&times;</button>
+  </div>
+
   <script>
     const messagesEl = document.getElementById('messages');
     const waBadge = document.getElementById('wa-badge');
@@ -308,7 +433,7 @@ function renderDashboardHtml() {
     const stopFlashBtn = document.getElementById('stop-flash');
     const fullscreenBtn = document.getElementById('fullscreen');
 
-    let state = { messages: [], connected: false, watchedGroups: [], keywordMode: 'all', keywords: [], pulseEnabled: false, pulseMode: 'all', pulseKeywords: [], flashMode: 'all', messageFontSize: 42, groupKeywords: {} };
+    let state = { messages: [], connected: false, watchedGroups: [], keywordMode: 'all', keywords: [], pulseEnabled: false, pulseMode: 'all', pulseKeywords: [], flashMode: 'all', messageFontSize: 42, showImages: true, groupKeywords: {} };
 
     function render() {
       waBadge.textContent = 'WhatsApp: ' + (state.connected ? 'Connected' : 'Disconnected');
@@ -345,9 +470,25 @@ function renderDashboardHtml() {
 
       messagesEl.innerHTML = rows.map((msg) => {
         const ts = new Date(msg.ts).toLocaleString();
+        const hasImage = state.showImages && msg.imageUrl;
+        const text = msg.text || '';
+        const isImageOnly = hasImage && (text === '' || text === '[Image]');
+        let textHtml = '';
+        if (!isImageOnly && text) {
+          textHtml = '<div class="text">' + escapeHtml(text) + '</div>';
+        }
+        let mediaHtml = '';
+        if (hasImage) {
+          const fullUrl = msg.imageUrl.startsWith('http') ? msg.imageUrl : (location.origin + msg.imageUrl);
+          mediaHtml = '<div class="msg-media"><div class="msg-thumb">'
+            + '<img class="msg-thumb-img" src="' + escapeAttr(msg.imageUrl) + '" alt="Attachment" data-full="' + escapeAttr(fullUrl) + '">'
+            + '<a class="download-btn" href="' + escapeAttr(fullUrl) + '" download title="Download image" onclick="event.stopPropagation()">&#8595;</a>'
+            + '</div></div>';
+        }
         return '<div class="msg">'
           + '<div class="meta">' + escapeHtml(msg.groupName || msg.chatId) + ' | ' + escapeHtml(msg.sender || 'Unknown') + ' | ' + ts + '</div>'
-          + '<div class="text">' + escapeHtml(msg.text || '') + '</div>'
+          + textHtml
+          + mediaHtml
           + '</div>';
       }).join('');
     }
@@ -356,6 +497,11 @@ function renderDashboardHtml() {
       const div = document.createElement('div');
       div.textContent = String(value || '');
       return div.innerHTML;
+    }
+    function escapeAttr(value) {
+      const div = document.createElement('div');
+      div.textContent = String(value || '');
+      return div.innerHTML.replace(/"/g, '&quot;');
     }
 
     function stopFlash() {
@@ -375,6 +521,34 @@ function renderDashboardHtml() {
         await document.exitFullscreen();
       }
     };
+
+    const imgModal = document.getElementById('img-modal');
+    const imgModalImg = document.getElementById('img-modal-img');
+    const imgModalClose = document.getElementById('img-modal-close');
+
+    function openImageModal(src) {
+      imgModalImg.src = src;
+      imgModal.classList.add('open');
+      imgModal.setAttribute('aria-hidden', 'false');
+      document.body.style.overflow = 'hidden';
+    }
+    function closeImageModal() {
+      imgModal.classList.remove('open');
+      imgModal.setAttribute('aria-hidden', 'true');
+      imgModalImg.src = '';
+      document.body.style.overflow = '';
+    }
+
+    imgModalClose.onclick = (e) => { e.stopPropagation(); closeImageModal(); };
+    imgModal.onclick = (e) => { if (e.target === imgModal) closeImageModal(); };
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && imgModal.classList.contains('open')) closeImageModal();
+    });
+
+    messagesEl.addEventListener('click', (e) => {
+      const thumb = e.target.closest('.msg-thumb-img');
+      if (thumb && thumb.dataset.full) openImageModal(thumb.dataset.full);
+    });
 
     function onSocketMessage(event) {
       const parsed = JSON.parse(event.data);
@@ -493,6 +667,9 @@ function renderSettingsHtml() {
     <h1>Display Settings</h1>
     <div class="muted">Choose what appears on the big screen.</div>
 
+    <h2>Images</h2>
+    <label><input id="show-images" type="checkbox" checked> Show images in messages (small thumbnail with download)</label>
+
     <h2>Message Filter</h2>
     <label><input id="keyword-toggle" type="checkbox"> Only show keyword matches</label>
     <input id="keywords" type="text" placeholder="keywords, comma, separated">
@@ -540,6 +717,7 @@ function renderSettingsHtml() {
   </div>
 
   <script>
+    const showImagesInput = document.getElementById('show-images');
     const keywordToggle = document.getElementById('keyword-toggle');
     const keywordsInput = document.getElementById('keywords');
     const pulseEnabledInput = document.getElementById('pulse-enabled');
@@ -607,6 +785,7 @@ function renderSettingsHtml() {
       groupsUnlocked = false;
       unlockedPin = '';
 
+      showImagesInput.checked = state.showImages !== false;
       keywordToggle.checked = state.keywordMode === 'keywords';
       keywordsInput.value = (state.keywords || []).join(', ');
       pulseEnabledInput.checked = Boolean(state.pulseEnabled);
@@ -693,6 +872,7 @@ function renderSettingsHtml() {
       const pinChanged = pinNew.length > 0;
 
       const payload = {
+        showImages: showImagesInput.checked,
         keywordMode: keywordToggle.checked ? 'keywords' : 'all',
         keywords,
         pulseEnabled: pulseEnabledInput.checked,

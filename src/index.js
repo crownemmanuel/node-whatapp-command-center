@@ -1,22 +1,29 @@
 import { exec } from "node:child_process"
 import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto"
 import pino from "pino"
-import { getQrPath, getSessionDir, loadConfig, normalizeConfig, saveConfig } from "./config-store.js"
+import { getMediaDir, getQrPath, getSessionDir, loadConfig, normalizeConfig, saveConfig } from "./config-store.js"
 import { createDashboardServer } from "./dashboard-server.js"
 import { runFirstSetup } from "./setup.js"
-import { WhatsAppBridge } from "./whatsapp.js"
+import { WhatsAppBridge, resetWhatsAppSession } from "./whatsapp.js"
 
 const LOG = pino({ name: "whatsapp-command-center", level: process.env.LOG_LEVEL || "info" })
 
 async function main() {
   let config = await loadConfig()
   const sessionDir = getSessionDir()
+  const mediaDir = getMediaDir()
   const qrPath = getQrPath()
-  const forceSetup = process.argv.includes("--setup")
+  const forceRescan = process.argv.includes("--rescan")
+  const forceSetup = process.argv.includes("--setup") || forceRescan
+
+  if (forceRescan) {
+    console.log("Rescan requested: clearing WhatsApp session so you can scan the QR code again...")
+    await resetWhatsAppSession(sessionDir)
+  }
 
   if (forceSetup || !config.watchedGroups.length) {
     if (forceSetup) {
-      console.log("Setup mode enabled. Reconfiguring watched groups...")
+      console.log(forceRescan ? "Scan the new QR code, then choose groups again." : "Setup mode enabled. Reconfiguring watched groups...")
     }
     config = await runFirstSetup({
       config,
@@ -44,6 +51,7 @@ async function main() {
     groupKeywords: config.groupKeywords,
     hasGroupPin: Boolean(config.groupPinHash),
     messageFontSize: config.messageFontSize,
+    showImages: config.showImages,
     messages: [],
   }
 
@@ -51,6 +59,7 @@ async function main() {
 
   const dashboard = createDashboardServer({
     port: config.dashboardPort,
+    mediaDir,
     getState: () => ({ ...state }),
     onUnlockGroups: async (incoming) => {
       const pin = typeof incoming?.pin === "string" ? incoming.pin.trim() : ""
@@ -94,6 +103,7 @@ async function main() {
         flashMode: incoming.pulseMode === "keywords" ? "keywords" : "all",
         groupKeywords: incoming.groupKeywords,
         messageFontSize: incoming.messageFontSize,
+        showImages: incoming.showImages,
         groupPinHash: wantsPinChange
           ? (pinNewRaw ? hashPin(pinNewRaw) : "")
           : config.groupPinHash,
@@ -113,6 +123,7 @@ async function main() {
       state.groupKeywords = config.groupKeywords
       state.hasGroupPin = Boolean(config.groupPinHash)
       state.messageFontSize = config.messageFontSize
+      state.showImages = config.showImages
       state.watchedGroups = config.watchedGroups
       watchedById = new Map(config.watchedGroups.map((group) => [group.id, group.name]))
       if (state.keywordMode === "keywords") {
@@ -130,6 +141,7 @@ async function main() {
 
   const bridge = new WhatsAppBridge({
     sessionDir,
+    mediaDir,
     onConnectionChange: (connected) => {
       state.connected = connected
       dashboard.broadcast({ type: "state", payload: { ...state } })

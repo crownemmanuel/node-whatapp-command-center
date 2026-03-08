@@ -12,6 +12,7 @@ export function defaultConfig() {
   return {
     dashboardPort: 3399,
     openDashboardOnStart: true,
+    showImages: true,
     knownGroups: [],
     watchedGroups: [],
     keywordMode: "all",
@@ -50,6 +51,10 @@ export async function saveConfig(config) {
 
 export function getSessionDir() {
   return path.join(ROOT, "baileys-auth")
+}
+
+export function getMediaDir() {
+  return path.join(DATA_DIR, "media")
 }
 
 export function getQrPath() {
@@ -101,6 +106,7 @@ export function normalizeConfig(input) {
   return {
     dashboardPort,
     openDashboardOnStart: safe.openDashboardOnStart !== false,
+    showImages: safe.showImages !== false,
     knownGroups,
     watchedGroups,
     keywordMode,

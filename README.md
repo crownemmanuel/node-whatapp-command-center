@@ -26,6 +26,14 @@ Re-run setup anytime (including searchable group picker):
 npm start -- --setup
 ```
 
+If the app loses connection to WhatsApp (e.g. dashboard still says "Connected" but messages stop, or you see decrypt/session errors in the log), re-link by rescanning the QR code:
+
+```bash
+npm start -- --rescan
+```
+
+Or with the global command: `whatsappCC --rescan`. This clears the WhatsApp session and runs setup again so you can scan a fresh QR and pick groups.
+
 ## Installed command (background mode)
 
 If installed as a package, run:
